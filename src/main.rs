@@ -3,6 +3,7 @@ use chrono::{DateTime, Local, Utc};
 use clap::Parser;
 use dialoguer::{Confirm, Input, Select};
 use indicatif::{ProgressBar, ProgressStyle};
+use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
@@ -15,6 +16,7 @@ use walkdir::WalkDir;
 #[derive(Parser, Debug)]
 #[command(name = "fordocu")]
 #[command(about = "Collect and document directory contents with hashes and metadata")]
+#[command(version)]
 struct Args {
     #[arg(long, help = "Do not compute MD5 hashes")]
     no_md5: bool,
@@ -89,6 +91,65 @@ struct FileEntry {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChecksumAlgorithm {
+    Md5,
+    Sha1,
+    Sha256,
+    Sha512,
+}
+
+impl ChecksumAlgorithm {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ChecksumAlgorithm::Md5 => "MD5",
+            ChecksumAlgorithm::Sha1 => "SHA-1",
+            ChecksumAlgorithm::Sha256 => "SHA-256",
+            ChecksumAlgorithm::Sha512 => "SHA-512",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ArtifactKind {
+    ChecksumFile(ChecksumAlgorithm),
+    DetachedSignature,
+}
+
+#[derive(Debug, Clone)]
+struct ExistingArtifact {
+    rel_path: String,
+    kind: ArtifactKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerificationStatus {
+    Ok,
+    Failed,
+    Missing,
+    Error,
+}
+
+impl VerificationStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            VerificationStatus::Ok => "OK",
+            VerificationStatus::Failed => "FAILED",
+            VerificationStatus::Missing => "MISSING",
+            VerificationStatus::Error => "ERROR",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VerificationResult {
+    artifact_path: String,
+    kind: String,
+    status: VerificationStatus,
+    summary: String,
+    details: Vec<String>,
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let hash_cfg = HashConfig::from_args(&args)?;
@@ -103,13 +164,25 @@ fn main() -> Result<()> {
 
     println!();
     println!("Scanning directory: {}", host_info.cwd.display());
-    let entries = scan_directory(&host_info.cwd, &report_name, &sig_name)?;
+    let (entries, artifacts) = scan_directory(&host_info.cwd, &report_name, &sig_name)?;
+    if !artifacts.is_empty() {
+        println!("Detected {} existing integrity artifact(s)", artifacts.len());
+    }
 
     println!("Hashing {} file(s)...", entries.iter().filter(|e| matches!(e.entry_type, EntryType::File)).count());
     let entries = hash_entries(entries, &hash_cfg)?;
 
+    let gpg = find_gpg();
+    let verification_results = verify_artifacts(&host_info.cwd, &artifacts, gpg.as_deref())?;
+    for result in &verification_results {
+        match result.status {
+            VerificationStatus::Ok => println!("  OK   {}: {}", result.artifact_path, result.summary),
+            _ => eprintln!("  {} {}: {}", result.status.as_str(), result.artifact_path, result.summary),
+        }
+    }
+
     let report_path = host_info.cwd.join(&report_name);
-    write_report(&report_path, &case_info, &host_info, &entries, &hash_cfg)?;
+    write_report(&report_path, &case_info, &host_info, &entries, &hash_cfg, &verification_results)?;
 
     let report_sha256 = sha256_file(&report_path)?;
 
@@ -119,8 +192,6 @@ fn main() -> Result<()> {
             .default(false)
             .interact()?
         {
-            // Append the integrity footer before signing so the signature covers it.
-            append_integrity_footer(&report_path, &report_name, &report_sha256, true)?;
             match sign_with_gpg(&gpg, &report_path, &host_info.cwd) {
                 Ok(key_id) => {
                     println!("Detached signature written: {}", sig_name);
@@ -132,12 +203,10 @@ fn main() -> Result<()> {
                 }
             }
         } else {
-            append_integrity_footer(&report_path, &report_name, &report_sha256, false)?;
             None
         }
     } else {
         println!("GPG not found; skipping signature step.");
-        append_integrity_footer(&report_path, &report_name, &report_sha256, false)?;
         None
     };
 
@@ -237,7 +306,7 @@ fn generate_report_name(cwd: &Path) -> String {
     name
 }
 
-fn scan_directory(cwd: &Path, report_name: &str, sig_name: &str) -> Result<Vec<FileEntry>> {
+fn scan_directory(cwd: &Path, report_name: &str, sig_name: &str) -> Result<(Vec<FileEntry>, Vec<ExistingArtifact>)> {
     let walker = WalkDir::new(cwd)
         .follow_links(false)
         .contents_first(false);
@@ -252,7 +321,8 @@ fn scan_directory(cwd: &Path, report_name: &str, sig_name: &str) -> Result<Vec<F
     );
     pb.set_message("scanning");
 
-    let mut result = Vec::new();
+    let mut file_entries = Vec::new();
+    let mut artifacts = Vec::new();
     for entry in entries {
         let path = entry.path();
         let rel_path = path
@@ -267,6 +337,12 @@ fn scan_directory(cwd: &Path, report_name: &str, sig_name: &str) -> Result<Vec<F
         };
 
         if rel_path == report_name || rel_path == sig_name {
+            pb.inc(1);
+            continue;
+        }
+
+        if let Some(artifact) = detect_artifact(&rel_path) {
+            artifacts.push(artifact);
             pb.inc(1);
             continue;
         }
@@ -289,7 +365,7 @@ fn scan_directory(cwd: &Path, report_name: &str, sig_name: &str) -> Result<Vec<F
             Err(_) => (0, None),
         };
 
-        result.push(FileEntry {
+        file_entries.push(FileEntry {
             rel_path,
             entry_type,
             size,
@@ -300,7 +376,45 @@ fn scan_directory(cwd: &Path, report_name: &str, sig_name: &str) -> Result<Vec<F
         pb.inc(1);
     }
     pb.finish_with_message("scan complete");
-    Ok(result)
+    Ok((file_entries, artifacts))
+}
+
+fn detect_artifact(rel_path: &str) -> Option<ExistingArtifact> {
+    let file_name = Path::new(rel_path).file_name()?.to_str()?;
+    let lower = file_name.to_lowercase();
+
+    if let Some(alg) = checksum_algorithm_from_name(file_name) {
+        return Some(ExistingArtifact {
+            rel_path: rel_path.to_string(),
+            kind: ArtifactKind::ChecksumFile(alg),
+        });
+    }
+
+    if lower.ends_with(".asc") || lower.ends_with(".sig") || lower.ends_with(".sign") {
+        return Some(ExistingArtifact {
+            rel_path: rel_path.to_string(),
+            kind: ArtifactKind::DetachedSignature,
+        });
+    }
+
+    None
+}
+
+fn checksum_algorithm_from_name(file_name: &str) -> Option<ChecksumAlgorithm> {
+    let upper = file_name.to_uppercase();
+    if upper == "MD5SUMS" || upper == "MD5SUMS.TXT" || upper.ends_with(".MD5") {
+        return Some(ChecksumAlgorithm::Md5);
+    }
+    if upper == "SHA1SUMS" || upper == "SHA1SUMS.TXT" || upper.ends_with(".SHA1") {
+        return Some(ChecksumAlgorithm::Sha1);
+    }
+    if upper == "SHA256SUMS" || upper == "SHA256SUMS.TXT" || upper.ends_with(".SHA256") {
+        return Some(ChecksumAlgorithm::Sha256);
+    }
+    if upper == "SHA512SUMS" || upper == "SHA512SUMS.TXT" || upper.ends_with(".SHA512") {
+        return Some(ChecksumAlgorithm::Sha512);
+    }
+    None
 }
 
 fn format_time(time: Option<SystemTime>) -> Option<String> {
@@ -375,12 +489,311 @@ fn hash_file(path: &Path, cfg: &HashConfig) -> Result<Hashes> {
     })
 }
 
+fn hash_file_with_algorithm(path: &Path, alg: ChecksumAlgorithm) -> Result<String> {
+    let file = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut buf = [0u8; 8192];
+
+    match alg {
+        ChecksumAlgorithm::Md5 => {
+            let mut hasher = md5::Context::new();
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.consume(&buf[..n]);
+            }
+            Ok(format!("{:x}", hasher.compute()))
+        }
+        ChecksumAlgorithm::Sha1 => {
+            let mut hasher = Sha1::new();
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            Ok(format!("{:x}", hasher.finalize()))
+        }
+        ChecksumAlgorithm::Sha256 => {
+            let mut hasher = Sha256::new();
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            Ok(format!("{:x}", hasher.finalize()))
+        }
+        ChecksumAlgorithm::Sha512 => {
+            let mut hasher = Sha512::new();
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            Ok(format!("{:x}", hasher.finalize()))
+        }
+    }
+}
+
+fn verify_artifacts(
+    cwd: &Path,
+    artifacts: &[ExistingArtifact],
+    gpg: Option<&str>,
+) -> Result<Vec<VerificationResult>> {
+    let mut results = Vec::new();
+    for artifact in artifacts {
+        let result = match &artifact.kind {
+            ArtifactKind::ChecksumFile(alg) => verify_checksum_file(cwd, &artifact.rel_path, *alg),
+            ArtifactKind::DetachedSignature => {
+                if let Some(gpg) = gpg {
+                    verify_detached_signature(cwd, &artifact.rel_path, gpg)
+                } else {
+                    Ok(VerificationResult {
+                        artifact_path: artifact.rel_path.clone(),
+                        kind: "GPG signature".to_string(),
+                        status: VerificationStatus::Error,
+                        summary: "GPG not available".to_string(),
+                        details: vec![],
+                    })
+                }
+            }
+        };
+        results.push(result.unwrap_or_else(|e| VerificationResult {
+            artifact_path: artifact.rel_path.clone(),
+            kind: match &artifact.kind {
+                ArtifactKind::ChecksumFile(alg) => format!("{} checksum file", alg.as_str()),
+                ArtifactKind::DetachedSignature => "GPG signature".to_string(),
+            },
+            status: VerificationStatus::Error,
+            summary: format!("Verification error: {}", e),
+            details: vec![],
+        }));
+    }
+    Ok(results)
+}
+
+fn verify_checksum_file(
+    cwd: &Path,
+    rel_path: &str,
+    alg: ChecksumAlgorithm,
+) -> Result<VerificationResult> {
+    let path = cwd.join(rel_path);
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read checksum file {}", path.display()))?;
+
+    let mut matched = 0usize;
+    let mut failed = 0usize;
+    let mut missing = 0usize;
+    let mut errors = 0usize;
+    let mut details = Vec::new();
+    let mut parsed_any = false;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some((expected, file_name)) = parse_checksum_line(line) {
+            parsed_any = true;
+            let file_path = cwd.join(&file_name);
+            if !file_path.exists() {
+                missing += 1;
+                details.push(format!("{}: referenced file not found", file_name));
+                continue;
+            }
+            match hash_file_with_algorithm(&file_path, alg) {
+                Ok(actual) => {
+                    if actual.eq_ignore_ascii_case(&expected) {
+                        matched += 1;
+                    } else {
+                        failed += 1;
+                        details.push(format!(
+                            "{}: expected {}, got {}",
+                            file_name, expected, actual
+                        ));
+                    }
+                }
+                Err(_) => {
+                    errors += 1;
+                    details.push(format!("{}: could not verify", file_name));
+                }
+            }
+        }
+    }
+
+    if !parsed_any {
+        return Ok(VerificationResult {
+            artifact_path: rel_path.to_string(),
+            kind: format!("{} checksum file", alg.as_str()),
+            status: VerificationStatus::Error,
+            summary: "No valid checksum entries found".to_string(),
+            details: vec![],
+        });
+    }
+
+    let total = matched + failed + missing + errors;
+    let status = if failed > 0 || errors > 0 {
+        VerificationStatus::Failed
+    } else if missing > 0 {
+        VerificationStatus::Missing
+    } else {
+        VerificationStatus::Ok
+    };
+
+    let summary = format!(
+        "{} matched, {} failed, {} missing, {} errors out of {} entries",
+        matched, failed, missing, errors, total
+    );
+
+    Ok(VerificationResult {
+        artifact_path: rel_path.to_string(),
+        kind: format!("{} checksum file", alg.as_str()),
+        status,
+        summary,
+        details,
+    })
+}
+
+fn parse_checksum_line(line: &str) -> Option<(String, String)> {
+    let hash_end = line.find(' ')?;
+    let hash = line[..hash_end].to_lowercase();
+    let rest = line[hash_end..].trim_start();
+
+    let file_name = if rest.starts_with('*') {
+        unescape_filename(&rest[1..])
+    } else {
+        unescape_filename(rest)
+    };
+
+    if hash.is_empty() || file_name.is_empty() {
+        return None;
+    }
+
+    Some((hash, file_name))
+}
+
+fn unescape_filename(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('r') => result.push('\r'),
+                Some('t') => result.push('\t'),
+                Some(other) => result.push(other),
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+fn verify_detached_signature(
+    cwd: &Path,
+    rel_path: &str,
+    gpg: &str,
+) -> Result<VerificationResult> {
+    let sig_path = cwd.join(rel_path);
+    let signed_rel_path = guess_signed_file(rel_path);
+    let signed_path = cwd.join(&signed_rel_path);
+
+    if !signed_path.exists() {
+        return Ok(VerificationResult {
+            artifact_path: rel_path.to_string(),
+            kind: "GPG signature".to_string(),
+            status: VerificationStatus::Missing,
+            summary: format!("Signed file '{}' not found", signed_rel_path.display()),
+            details: vec![],
+        });
+    }
+
+    let output = Command::new(gpg)
+        .arg("--verify")
+        .arg(&sig_path)
+        .arg(&signed_path)
+        .output()
+        .context("Failed to run gpg --verify")?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{}{}", stderr, stdout);
+
+    let (status, summary) = if output.status.success() {
+        let signer = extract_gpg_signer(&combined);
+        (
+            VerificationStatus::Ok,
+            signer.unwrap_or_else(|| "Good signature".to_string()),
+        )
+    } else if combined.contains("BAD signature") {
+        (VerificationStatus::Failed, "BAD signature".to_string())
+    } else if combined.contains("No public key") || combined.contains("No such file or directory") {
+        (VerificationStatus::Error, "Public key not found".to_string())
+    } else {
+        (
+            VerificationStatus::Error,
+            format!("GPG verification failed: {}", combined.trim()),
+        )
+    };
+
+    Ok(VerificationResult {
+        artifact_path: rel_path.to_string(),
+        kind: "GPG signature".to_string(),
+        status,
+        summary,
+        details: combined.lines().map(|s| s.to_string()).collect(),
+    })
+}
+
+fn guess_signed_file(rel_path: &str) -> PathBuf {
+    let name = Path::new(rel_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let lower = name.to_lowercase();
+    let stripped = if lower.ends_with(".asc") {
+        &name[..name.len() - 4]
+    } else if lower.ends_with(".sig") {
+        &name[..name.len() - 4]
+    } else if lower.ends_with(".sign") {
+        &name[..name.len() - 5]
+    } else {
+        &name[..]
+    };
+    PathBuf::from(stripped)
+}
+
+fn extract_gpg_signer(output: &str) -> Option<String> {
+    for line in output.lines() {
+        if let Some(start) = line.find("Good signature from \"") {
+            let rest = &line[start + 21..];
+            if let Some(end) = rest.find('"') {
+                return Some(format!("Good signature from {}", &rest[..end]));
+            }
+        }
+        if let Some(start) = line.find("Good signature from ") {
+            return Some(line[start..].to_string());
+        }
+    }
+    None
+}
+
 fn write_report(
     path: &Path,
     case: &CaseInfo,
     host: &HostInfo,
     entries: &[FileEntry],
     cfg: &HashConfig,
+    verification_results: &[VerificationResult],
 ) -> Result<()> {
     let mut f = File::create(path).with_context(|| format!("Failed to create {}", path.display()))?;
     let now = Local::now();
@@ -421,6 +834,25 @@ fn write_report(
     writeln!(f, "OS:       {}", host.os)?;
     writeln!(f, "Kernel:   {}", host.kernel)?;
     writeln!(f)?;
+
+    if !verification_results.is_empty() {
+        writeln!(f, "EXISTING INTEGRITY ARTIFACTS")?;
+        writeln!(f, "--------------------------------------------------------------------------------")?;
+        for result in verification_results {
+            writeln!(
+                f,
+                "[{}] {} ({}): {}",
+                result.status.as_str(),
+                result.artifact_path,
+                result.kind,
+                result.summary
+            )?;
+            for detail in &result.details {
+                writeln!(f, "         {}", detail)?;
+            }
+        }
+        writeln!(f)?;
+    }
 
     writeln!(f, "DIRECTORY LISTING")?;
     writeln!(f, "--------------------------------------------------------------------------------")?;
@@ -494,6 +926,15 @@ fn write_report(
         }
     }
 
+    writeln!(f)?;
+    writeln!(f, "================================================================================")?;
+    writeln!(
+        f,
+        "Documented via fordocu v{} — https://github.com/overcuriousity/fordocu",
+        env!("CARGO_PKG_VERSION")
+    )?;
+    writeln!(f, "================================================================================")?;
+
     Ok(())
 }
 
@@ -510,31 +951,6 @@ fn sha256_file(path: &Path) -> Result<String> {
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn append_integrity_footer(
-    path: &Path,
-    report_name: &str,
-    report_sha256: &str,
-    signed: bool,
-) -> Result<()> {
-    let mut f = fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .with_context(|| format!("Failed to open {} for appending", path.display()))?;
-
-    writeln!(f)?;
-    writeln!(f, "REPORT INTEGRITY")?;
-    writeln!(f, "--------------------------------------------------------------------------------")?;
-    writeln!(f, "Report file:    {}", report_name)?;
-    writeln!(f, "Report SHA-256: {}", report_sha256)?;
-    if signed {
-        writeln!(f, "GPG signature:  {}.asc", report_name)?;
-    } else {
-        writeln!(f, "GPG signature:  none")?;
-    }
-    writeln!(f, "================================================================================")?;
-    Ok(())
 }
 
 fn find_gpg() -> Option<String> {

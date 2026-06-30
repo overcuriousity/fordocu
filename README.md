@@ -59,6 +59,17 @@ The tool interactively asks for:
 
 It then scans the directory recursively, computes hashes, writes `collection_report_<timestamp>.txt`, and optionally signs it with GPG.
 
+### Existing integrity artifacts
+
+If the directory already contains integrity artifacts, `fordocu` detects and verifies them before creating the new report:
+
+- Checksum files: `SHA256SUMS`, `SHA256SUMS.txt`, `MD5SUMS`, `MD5SUMS.txt`, `SHA1SUMS`, `SHA1SUMS.txt`, `SHA512SUMS`, `SHA512SUMS.txt`, or files ending in `.md5`, `.sha1`, `.sha256`, `.sha512`.
+- Detached signatures: files ending in `.asc`, `.sig`, or `.sign`.
+
+For checksum files, each entry is re-computed and compared to the expected value. For detached signatures, `fordocu` tries to find the corresponding signed file and verifies it with GPG. The verification result is printed to the console and recorded in the report under **EXISTING INTEGRITY ARTIFACTS**.
+
+These artifacts are excluded from the directory listing so they are not treated as part of the acquired data.
+
 ## CLI options
 
 ```

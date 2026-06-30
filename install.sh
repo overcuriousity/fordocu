@@ -62,10 +62,23 @@ else
 fi
 
 mkdir -p "$INSTALL_DIR"
+
+if [ -f "$INSTALL_DIR/$BINARY" ]; then
+    echo "Updating existing $BINARY in $INSTALL_DIR..."
+else
+    echo "Installing $BINARY to $INSTALL_DIR..."
+fi
+
 cp "$TMP_DIR/$BINARY" "$INSTALL_DIR/"
 chmod +x "$INSTALL_DIR/$BINARY"
 
-echo "Installed $BINARY to $INSTALL_DIR"
+VERSION=$("$INSTALL_DIR/$BINARY" --version 2>/dev/null || true)
+if [ -n "$VERSION" ]; then
+    echo "$VERSION"
+else
+    echo "Installed $BINARY to $INSTALL_DIR"
+fi
+
 if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
     echo "Warning: $INSTALL_DIR is not in your PATH."
 fi
