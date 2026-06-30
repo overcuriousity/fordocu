@@ -472,20 +472,14 @@ fn write_report(
         if let Some(err) = &entry.error {
             writeln!(f, "         ERROR: {}", err)?;
         } else if let Some(hashes) = &entry.hashes {
-            if cfg.md5 {
-                if let Some(h) = &hashes.md5 {
-                    writeln!(f, "         MD5:    {}", h)?;
-                }
+            if cfg.md5 && let Some(h) = &hashes.md5 {
+                writeln!(f, "         MD5:    {}", h)?;
             }
-            if cfg.sha256 {
-                if let Some(h) = &hashes.sha256 {
-                    writeln!(f, "         SHA-256: {}", h)?;
-                }
+            if cfg.sha256 && let Some(h) = &hashes.sha256 {
+                writeln!(f, "         SHA-256: {}", h)?;
             }
-            if cfg.sha512 {
-                if let Some(h) = &hashes.sha512 {
-                    writeln!(f, "         SHA-512: {}", h)?;
-                }
+            if cfg.sha512 && let Some(h) = &hashes.sha512 {
+                writeln!(f, "         SHA-512: {}", h)?;
             }
         }
     }
@@ -609,7 +603,7 @@ fn sign_with_gpg(gpg: &str, report_path: &Path, _cwd: &Path) -> Result<String> {
 
 fn list_secret_keys(gpg: &str) -> Result<Vec<(String, String)>> {
     let output = Command::new(gpg)
-        .args(&["--list-secret-keys", "--with-colons"])
+        .args(["--list-secret-keys", "--with-colons"])
         .output()
         .context("Failed to list GPG secret keys")?;
 
@@ -623,14 +617,12 @@ fn list_secret_keys(gpg: &str) -> Result<Vec<(String, String)>> {
             if parts.len() > 4 && !parts[4].is_empty() {
                 current_key = Some(parts[4].to_string());
             }
-        } else if line.starts_with("uid:") {
-            if let Some(ref key_id) = current_key {
-                let parts: Vec<&str> = line.split(':').collect();
-                if parts.len() > 9 {
-                    let uid = parts[9].to_string();
-                    keys.push((key_id.clone(), uid));
-                    current_key = None;
-                }
+        } else if line.starts_with("uid:") && let Some(ref key_id) = current_key {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() > 9 {
+                let uid = parts[9].to_string();
+                keys.push((key_id.clone(), uid));
+                current_key = None;
             }
         }
     }
