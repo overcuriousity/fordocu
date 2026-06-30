@@ -1,1 +1,10 @@
 /target
+Cargo.lock
+collection_report_*.txt
+collection_report_*.asc
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/

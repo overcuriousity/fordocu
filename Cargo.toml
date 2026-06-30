@@ -4,3 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0"
+chrono = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+dialoguer = "0.11"
+hostname = "0.4"
+indicatif = "0.17"
+md5 = "0.7"
+sha2 = "0.10"
+sysinfo = "0.30"
+walkdir = "2.5"
+whoami = "1.5"
